@@ -1,0 +1,51 @@
+name: market-data
+
+on:
+  schedule:
+    - cron: "0 5 * * 1-5"
+    - cron: "20 20 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: market-data
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Fetch market data
+        env:
+          TINVEST_TOKEN: ${{ secrets.TINVEST_TOKEN }}
+        run: python fetch_market_data.py
+
+      - name: Commit snapshot
+        if: always()
+        run: |
+          if [ ! -f data/market_snapshot.json ]; then
+            echo "no snapshot"
+            exit 0
+          fi
+          git config user.name  "market-data-bot"
+          git config user.email "market-data-bot@users.noreply.github.com"
+          git add data/market_snapshot.json
+          if git diff --cached --quiet; then
+            echo "no changes"
+          else
+            git commit -m "data: market snapshot $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
