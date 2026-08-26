@@ -14,8 +14,8 @@
 
 Источники:
   RU     — T-Invest API, если задан секрет TINVEST_TOKEN; иначе MOEX ISS
-  US     — Stooq         https://stooq.com
-  CRYPTO — Binance       https://api.binance.com
+  US     — Yahoo Finance, с откатом на Stooq
+  CRYPTO — Binance, с откатом на Coinbase и Kraken
 
 Кроме T-Invest ключи не нужны нигде. Токен T-Invest берётся ТОЛЬКО из переменной
 окружения (GitHub Secrets) и никогда не хранится в коде, в репозитории и в снимке.
@@ -36,14 +36,18 @@ import requests
 MSK = timezone(timedelta(hours=3))
 HTTP_TIMEOUT = 30
 RETRIES = 3
-UA = {"User-Agent": "market-brief-feed/1.0 (+github actions)"}
+UA = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                     "AppleWebKit/537.36 (KHTML, like Gecko) "
+                     "Chrome/128.0.0.0 Safari/537.36"),
+      "Accept": "*/*"}
 
 RU_TICKERS = ["SBER", "GAZP", "LKOH", "GMKN", "ROSN", "NVTK", "TATN", "MTSS",
               "MGNT", "PLZL", "CHMF", "ALRS", "YDEX", "VTBR", "AFLT"]
 US_TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AMD",
               "AVGO", "JPM", "XOM", "SPY", "QQQ", "IWM", "TLT"]
-CRYPTO_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-                  "TONUSDT", "DOGEUSDT", "LINKUSDT"]
+# Базовые активы. Пара под каждый источник собирается автоматически:
+# Binance BTCUSDT, Coinbase BTC-USD, Kraken XBTUSD.
+CRYPTO_ASSETS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "LINK", "AVAX", "LTC"]
 
 LOOKBACK_DAYS = 420  # хватает на SMA200 с запасом на выходные и праздники
 
@@ -260,21 +264,64 @@ def fetch_tinvest(ticker: str) -> pd.DataFrame:
     raise RuntimeError("T-Invest недоступен: %s" % last_err)
 
 
+# Какой источник фактически отдал данные по каждому инструменту.
+# Заполняется каскадами и попадает в снимок, чтобы источник был виден построчно.
+LAST_SOURCE = {}
+
+
+def fetch_yahoo(ticker: str) -> pd.DataFrame:
+    """Дневные свечи Yahoo Finance. Ключ не нужен, доступен с раннеров GitHub."""
+    data = http_get("https://query1.finance.yahoo.com/v8/finance/chart/%s" % ticker,
+                    {"range": "2y", "interval": "1d", "includePrePost": "false"})
+    chart = (data or {}).get("chart") or {}
+    if chart.get("error"):
+        raise RuntimeError("Yahoo вернул ошибку: %s" % chart["error"])
+    res = (chart.get("result") or [None])[0]
+    if not res or not res.get("timestamp"):
+        raise RuntimeError("Yahoo не вернул свечей по %s" % ticker)
+    q = res["indicators"]["quote"][0]
+    df = pd.DataFrame({
+        "date": pd.to_datetime(res["timestamp"], unit="s", utc=True).date,
+        "open": q.get("open"), "high": q.get("high"),
+        "low": q.get("low"), "close": q.get("close"),
+        "volume": q.get("volume"),
+    })
+    return df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
+
+
 def fetch_stooq(ticker: str) -> pd.DataFrame:
+    """Запасной источник по США. Stooq режет частые запросы и не любит роботов."""
     text = http_get("https://stooq.com/q/d/l/",
                     {"s": "%s.us" % ticker.lower(), "i": "d"}, expect="text")
-    if "Date" not in text[:200]:
-        raise RuntimeError("stooq вернул не CSV по %s" % ticker)
+    head = text[:200].lower()
+    if "date" not in head:
+        raise RuntimeError("stooq отдал не CSV, а «%s»" % text[:80].strip().replace("\n", " "))
     df = pd.read_csv(io.StringIO(text))
     df.columns = [c.strip().lower() for c in df.columns]
     df["date"] = pd.to_datetime(df["date"]).dt.date
     df = df.sort_values("date").tail(LOOKBACK_DAYS)
-    return df[["date", "open", "high", "low", "close", "volume"]]
+    return df[["date", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
 
 
-def fetch_binance(symbol: str) -> pd.DataFrame:
+def fetch_us(ticker: str) -> pd.DataFrame:
+    """Каскад по США: Yahoo, затем Stooq. Первый ответивший выигрывает."""
+    errors = []
+    for name, fn in (("Yahoo", fetch_yahoo), ("Stooq", fetch_stooq)):
+        try:
+            df = fn(ticker)
+            if len(df) >= 30:
+                LAST_SOURCE[ticker] = name
+                return df
+            errors.append("%s: мало свечей (%d)" % (name, len(df)))
+        except Exception as exc:                      # noqa: BLE001
+            errors.append("%s: %s" % (name, str(exc)[:150]))
+    raise RuntimeError(" | ".join(errors))
+
+
+def fetch_binance(asset: str) -> pd.DataFrame:
+    """Binance отдаёт 451 с американских адресов, а раннеры GitHub — американские."""
     data = http_get("https://api.binance.com/api/v3/klines",
-                    {"symbol": symbol, "interval": "1d", "limit": 500})
+                    {"symbol": "%sUSDT" % asset, "interval": "1d", "limit": 500})
     df = pd.DataFrame(data, columns=[
         "open_time", "open", "high", "low", "close", "volume", "close_time",
         "qav", "trades", "tbbav", "tbqav", "ignore"])
@@ -282,6 +329,57 @@ def fetch_binance(symbol: str) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c])
     df["date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.date
     return df[["date", "open", "high", "low", "close", "volume"]]
+
+
+def fetch_coinbase(asset: str) -> pd.DataFrame:
+    """Coinbase Exchange: до 300 дневных свечей за запрос, ключ не нужен."""
+    data = http_get("https://api.exchange.coinbase.com/products/%s-USD/candles" % asset,
+                    {"granularity": 86400})
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("Coinbase не вернул свечей по %s" % asset)
+    # формат строки: [time, low, high, open, close, volume], по убыванию времени
+    df = pd.DataFrame(data, columns=["time", "low", "high", "open", "close", "volume"])
+    df["date"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.date
+    return df[["date", "open", "high", "low", "close", "volume"]].sort_values("date")
+
+
+KRAKEN_PAIR = {"BTC": "XBTUSD", "DOGE": "XDGUSD"}
+
+
+def fetch_kraken(asset: str) -> pd.DataFrame:
+    """Kraken: до 720 дневных свечей. У биткоина и доджа собственные тикеры."""
+    pair = KRAKEN_PAIR.get(asset, "%sUSD" % asset)
+    data = http_get("https://api.kraken.com/0/public/OHLC",
+                    {"pair": pair, "interval": 1440})
+    if data.get("error"):
+        raise RuntimeError("Kraken: %s" % data["error"])
+    result = {k: v for k, v in (data.get("result") or {}).items() if k != "last"}
+    if not result:
+        raise RuntimeError("Kraken не вернул свечей по %s" % asset)
+    rows = next(iter(result.values()))
+    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close",
+                                     "vwap", "volume", "count"])
+    for c in ("open", "high", "low", "close", "volume"):
+        df[c] = pd.to_numeric(df[c])
+    df["date"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.date
+    return df[["date", "open", "high", "low", "close", "volume"]].sort_values("date")
+
+
+def fetch_crypto(asset: str) -> pd.DataFrame:
+    """Каскад по крипте: Binance, затем Coinbase, затем Kraken."""
+    errors = []
+    for name, fn in (("Binance", fetch_binance),
+                     ("Coinbase", fetch_coinbase),
+                     ("Kraken", fetch_kraken)):
+        try:
+            df = fn(asset)
+            if len(df) >= 30:
+                LAST_SOURCE[asset] = name
+                return df
+            errors.append("%s: мало свечей (%d)" % (name, len(df)))
+        except Exception as exc:                      # noqa: BLE001
+            errors.append("%s: %s" % (name, str(exc)[:120]))
+    raise RuntimeError(" | ".join(errors))
 
 
 # -------------------------------------------------------------------- сборка
@@ -317,22 +415,33 @@ def main():
         "note": ("Индикаторы посчитаны по фактическим дневным свечам библиотекой pandas, "
                  "а не взяты со стороннего сайта. RSI по Уайлдеру, MACD(12,26,9), "
                  "ATR(14) по Уайлдеру."),
-        "sources": {"RU": ru_source, "US": "Stooq", "CRYPTO": "Binance"},
+        "sources": {"RU": ru_source,
+                    "US": "Yahoo Finance / Stooq",
+                    "CRYPTO": "Binance / Coinbase / Kraken"},
         "markets": {}, "failures": [],
     }
 
     ru, f1 = collect("RU", RU_TICKERS, ru_fetcher,
                      lambda t: {"market": "RU", "ticker": t, "exchange": "MOEX",
                                 "currency": "RUB", "source": ru_source})
-    us, f2 = collect("US", US_TICKERS, fetch_stooq,
+    us, f2 = collect("US", US_TICKERS, fetch_us,
                      lambda t: {"market": "US", "ticker": t, "exchange": "US",
-                                "currency": "USD", "source": "Stooq"})
-    cr, f3 = collect("CRYPTO", CRYPTO_SYMBOLS, fetch_binance,
-                     lambda t: {"market": "CRYPTO", "ticker": t, "exchange": "Binance",
-                                "currency": "USDT", "source": "Binance"})
+                                "currency": "USD",
+                                "source": LAST_SOURCE.get(t, "н/д")})
+    cr, f3 = collect("CRYPTO", CRYPTO_ASSETS, fetch_crypto,
+                     lambda t: {"market": "CRYPTO", "ticker": t,
+                                "exchange": LAST_SOURCE.get(t, "н/д"),
+                                "currency": "USDT" if LAST_SOURCE.get(t) == "Binance" else "USD",
+                                "source": LAST_SOURCE.get(t, "н/д")})
 
     snapshot["markets"] = {"RU": ru, "US": us, "CRYPTO": cr}
     snapshot["failures"] = f1 + f2 + f3
+    used_us = sorted({r["source"] for r in us if r.get("source")})
+    used_cr = sorted({r["source"] for r in cr if r.get("source")})
+    if used_us:
+        snapshot["sources"]["US"] = ", ".join(used_us)
+    if used_cr:
+        snapshot["sources"]["CRYPTO"] = ", ".join(used_cr)
 
     os.makedirs("data", exist_ok=True)
     with open("data/market_snapshot.json", "w", encoding="utf-8") as f:
