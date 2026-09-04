@@ -12,10 +12,15 @@
 
     curl -s https://raw.githubusercontent.com/<user>/<repo>/main/data/market_snapshot.json
 
-Источники:
+Источники свечей:
   RU     — T-Invest API, если задан секрет TINVEST_TOKEN; иначе MOEX ISS
   US     — Yahoo Finance, с откатом на Stooq
   CRYPTO — Binance, с откатом на Coinbase и Kraken
+
+Источники живой котировки (поле last_price, отдельно от закрытия свечи):
+  RU     — блок marketdata MOEX ISS, вся доска TQBR одним запросом, без токена
+  US     — regularMarketPrice из тех же метаданных Yahoo, отдельный запрос не нужен
+  CRYPTO — тикер Coinbase
 
 Кроме T-Invest ключи не нужны нигде. Токен T-Invest берётся ТОЛЬКО из переменной
 окружения (GitHub Secrets) и никогда не хранится в коде, в репозитории и в снимке.
@@ -268,6 +273,62 @@ def fetch_tinvest(ticker: str) -> pd.DataFrame:
 # Заполняется каскадами и попадает в снимок, чтобы источник был виден построчно.
 LAST_SOURCE = {}
 
+# Живая котировка по инструменту: {"price": float, "ts": "...", "source": "..."}.
+# Отдельно от last_close: закрытие свечи нужно индикаторам, живая цена — торговой карточке.
+LAST_QUOTE = {}
+
+
+def fetch_moex_marketdata() -> int:
+    """Текущие котировки всей доски TQBR одним запросом. Токен не нужен.
+
+    Блок marketdata отдаёт LAST, BID, OFFER и время обновления по каждой бумаге.
+    Вне торговой сессии LAST пуст — тогда берём цену последней сделки дня
+    (MARKETPRICETODAY), затем средневзвешенную (WAPRICE).
+    """
+    try:
+        data = http_get("https://iss.moex.com/iss/engines/stock/markets/shares"
+                        "/boards/TQBR/securities.json",
+                        {"iss.only": "marketdata", "iss.meta": "off"})
+    except Exception as exc:                          # noqa: BLE001
+        print("[warn] MOEX marketdata недоступен: %s" % str(exc)[:200], file=sys.stderr)
+        return 0
+    block = (data or {}).get("marketdata") or {}
+    cols = block.get("columns") or []
+    rows = block.get("data") or []
+    if not cols or not rows:
+        return 0
+    idx = {name: i for i, name in enumerate(cols)}
+    need = ("SECID", "LAST", "MARKETPRICETODAY", "WAPRICE", "UPDATETIME", "SYSTIME")
+    if "SECID" not in idx:
+        return 0
+    n = 0
+    for row in rows:
+        def val(name):
+            i = idx.get(name)
+            return row[i] if i is not None and i < len(row) else None
+        secid = val("SECID")
+        price = next((v for v in (val("LAST"), val("MARKETPRICETODAY"), val("WAPRICE"))
+                      if isinstance(v, (int, float))), None)
+        if not secid or price is None:
+            continue
+        LAST_QUOTE[secid] = {"price": r2(price),
+                             "ts": str(val("SYSTIME") or val("UPDATETIME") or ""),
+                             "source": "MOEX ISS marketdata"}
+        n += 1
+    print("MOEX marketdata: живых котировок %d" % n, file=sys.stderr)
+    return n
+
+
+def fetch_coinbase_ticker(asset: str):
+    """Текущая цена спота Coinbase. Ошибка не критична — цена останется от свечи."""
+    try:
+        d = http_get("https://api.exchange.coinbase.com/products/%s-USD/ticker" % asset)
+        price = float(d["price"])
+        LAST_QUOTE[asset] = {"price": r2(price), "ts": str(d.get("time") or ""),
+                             "source": "Coinbase ticker"}
+    except Exception as exc:                          # noqa: BLE001
+        print("[warn] Coinbase ticker %s: %s" % (asset, str(exc)[:120]), file=sys.stderr)
+
 
 def fetch_yahoo(ticker: str) -> pd.DataFrame:
     """Дневные свечи Yahoo Finance. Ключ не нужен, доступен с раннеров GitHub."""
@@ -279,6 +340,19 @@ def fetch_yahoo(ticker: str) -> pd.DataFrame:
     res = (chart.get("result") or [None])[0]
     if not res or not res.get("timestamp"):
         raise RuntimeError("Yahoo не вернул свечей по %s" % ticker)
+
+    # Живая котировка лежит в метаданных того же ответа — отдельный запрос не нужен.
+    meta = res.get("meta") or {}
+    rmp = meta.get("regularMarketPrice")
+    if isinstance(rmp, (int, float)):
+        rmt = meta.get("regularMarketTime")
+        LAST_QUOTE[ticker] = {
+            "price": r2(rmp),
+            "ts": (datetime.fromtimestamp(rmt, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                   if isinstance(rmt, (int, float)) else ""),
+            "source": "Yahoo Finance regularMarketPrice",
+        }
+
     q = res["indicators"]["quote"][0]
     df = pd.DataFrame({
         "date": pd.to_datetime(res["timestamp"], unit="s", utc=True).date,
@@ -384,6 +458,14 @@ def fetch_crypto(asset: str) -> pd.DataFrame:
 
 # -------------------------------------------------------------------- сборка
 
+def quote_fields(key: str) -> dict:
+    """Три поля живой котировки для строки снимка. Нет данных — честные null."""
+    q = LAST_QUOTE.get(key) or {}
+    return {"last_price": q.get("price"),
+            "last_price_ts": q.get("ts") or None,
+            "last_price_source": q.get("source") or None}
+
+
 def collect(market, items, fetcher, meta_fn):
     out, failures = [], []
     for item in items:
@@ -414,25 +496,39 @@ def main():
         "timeframe": "1D",
         "note": ("Индикаторы посчитаны по фактическим дневным свечам библиотекой pandas, "
                  "а не взяты со стороннего сайта. RSI по Уайлдеру, MACD(12,26,9), "
-                 "ATR(14) по Уайлдеру."),
+                 "ATR(14) по Уайлдеру. В каждой строке два ценовых поля: last_close — "
+                 "закрытие последней дневной свечи, основа индикаторов; last_price — "
+                 "живая котировка на момент снимка со своей меткой времени, её и надо "
+                 "брать ценой входа в торговую карточку."),
         "sources": {"RU": ru_source,
                     "US": "Yahoo Finance / Stooq",
                     "CRYPTO": "Binance / Coinbase / Kraken"},
         "markets": {}, "failures": [],
     }
 
-    ru, f1 = collect("RU", RU_TICKERS, ru_fetcher,
-                     lambda t: {"market": "RU", "ticker": t, "exchange": "MOEX",
-                                "currency": "RUB", "source": ru_source})
-    us, f2 = collect("US", US_TICKERS, fetch_us,
-                     lambda t: {"market": "US", "ticker": t, "exchange": "US",
-                                "currency": "USD",
-                                "source": LAST_SOURCE.get(t, "н/д")})
-    cr, f3 = collect("CRYPTO", CRYPTO_ASSETS, fetch_crypto,
-                     lambda t: {"market": "CRYPTO", "ticker": t,
-                                "exchange": LAST_SOURCE.get(t, "н/д"),
-                                "currency": "USDT" if LAST_SOURCE.get(t) == "Binance" else "USD",
-                                "source": LAST_SOURCE.get(t, "н/д")})
+    # Живые котировки всей доски MOEX одним запросом, до обхода свечей.
+    # Работает без токена и при включённом T-Invest тоже: биржа та же.
+    fetch_moex_marketdata()
+
+    def ru_meta(t):
+        return {"market": "RU", "ticker": t, "exchange": "MOEX",
+                "currency": "RUB", "source": ru_source, **quote_fields(t)}
+
+    def us_meta(t):
+        return {"market": "US", "ticker": t, "exchange": "US", "currency": "USD",
+                "source": LAST_SOURCE.get(t, "н/д"), **quote_fields(t)}
+
+    def crypto_meta(t):
+        if LAST_SOURCE.get(t) in ("Coinbase", "Binance", "Kraken"):
+            fetch_coinbase_ticker(t)
+        return {"market": "CRYPTO", "ticker": t,
+                "exchange": LAST_SOURCE.get(t, "н/д"),
+                "currency": "USDT" if LAST_SOURCE.get(t) == "Binance" else "USD",
+                "source": LAST_SOURCE.get(t, "н/д"), **quote_fields(t)}
+
+    ru, f1 = collect("RU", RU_TICKERS, ru_fetcher, ru_meta)
+    us, f2 = collect("US", US_TICKERS, fetch_us, us_meta)
+    cr, f3 = collect("CRYPTO", CRYPTO_ASSETS, fetch_crypto, crypto_meta)
 
     snapshot["markets"] = {"RU": ru, "US": us, "CRYPTO": cr}
     snapshot["failures"] = f1 + f2 + f3
