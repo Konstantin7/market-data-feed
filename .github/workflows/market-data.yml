@@ -1,8 +1,19 @@
 name: market-data
 
+# Четыре запуска в сутки. Два обслуживают задачи Claude, два держат
+# поле last_price свежим на случай, если сводка выйдет в середине дня:
+#   05:00 UTC = 08:00 МСК — за полчаса до утренней сводки
+#   09:00 UTC = 12:00 МСК — середина российской сессии
+#   16:00 UTC = 19:00 МСК — закрытие МосБиржи, первый час сессии США
+#   20:20 UTC = 23:20 МСК — за десять минут до вечерней переоценки
+# Время cron в GitHub Actions — всегда UTC, и очередь раннеров может сдвинуть
+# запуск на несколько минут. Запас в 10-30 минут заложен намеренно.
+# Для публичного репозитория минуты Actions бесплатны, поэтому частота ничего не стоит.
 on:
   schedule:
     - cron: "0 5 * * 1-5"
+    - cron: "0 9 * * 1-5"
+    - cron: "0 16 * * 1-5"
     - cron: "20 20 * * 1-5"
   workflow_dispatch:
 
@@ -30,22 +41,28 @@ jobs:
 
       - name: Fetch market data
         env:
+          # Секрет необязателен. Если он не заведён, значение будет пустым
+          # и скрипт сам переключится на MOEX ISS.
           TINVEST_TOKEN: ${{ secrets.TINVEST_TOKEN }}
         run: python fetch_market_data.py
 
+      # if: always() — чтобы при сбое одного рынка свежие данные по остальным
+      # всё равно попали в репозиторий, а задание при этом осталось красным.
       - name: Commit snapshot
         if: always()
         run: |
           if [ ! -f data/market_snapshot.json ]; then
-            echo "no snapshot"
+            echo "Снимок не создан — коммитить нечего"
             exit 0
           fi
           git config user.name  "market-data-bot"
           git config user.email "market-data-bot@users.noreply.github.com"
           git add data/market_snapshot.json
+          # Коммитим только если файл действительно изменился,
+          # иначе история засорится пустыми коммитами по два раза в день.
           if git diff --cached --quiet; then
-            echo "no changes"
+            echo "Данные не изменились, коммит не нужен"
           else
-            git commit -m "data: market snapshot $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git commit -m "data: снимок рынка $(date -u '+%Y-%m-%d %H:%M UTC')"
             git push
           fi
